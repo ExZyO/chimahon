@@ -28,9 +28,9 @@ import chimahon.novel.sync.ttu.TtuSyncManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
@@ -288,6 +288,8 @@ class ReaderViewModel(
     private var lastSavedChapterIndex = 0
     private var lastSavedProgress = 0.0
     private var lastSavedCharacterCount = 0
+    private var progressChangedInSession = false
+    private var bookmarkLastModified: Long = 0L
 
     lateinit var statisticsTracker: ReaderStatisticsTracker
     private var trackingLocked = false
@@ -432,6 +434,8 @@ class ReaderViewModel(
                 // Seeded, not exact: first persist recomputes the true total from
                 // prefix sums, same as every chapter turn.
                 totalExploredCharCount = 0
+                val sidecarBookmark = BookStorage.loadBookmark(rootUrl)
+                bookmarkLastModified = sidecarBookmark?.lastModified ?: 0L
             } else {
                 // No explicit target: DB resume (or start at zero). The sidecar
                 // survives only for unregistered books.
@@ -439,13 +443,14 @@ class ReaderViewModel(
                 index = bookmark?.chapterIndex ?: 0
                 currentProgress = bookmark?.progress ?: 0.0
                 totalExploredCharCount = bookmark?.characterCount ?: 0
+                bookmarkLastModified = bookmark?.lastModified ?: 0L
             }
         }
         lastSavedChapterIndex = index
         lastSavedProgress = currentProgress
         lastSavedCharacterCount = totalExploredCharCount
 
-        val stats = BookStorage.loadStatistics(rootUrl)
+        val stats = runBlocking(Dispatchers.IO) { loadPersistedStatistics() }
         if (stats != null) {
             fullStatistics.addAll(stats)
 
@@ -783,7 +788,9 @@ class ReaderViewModel(
     }
 
     fun flushReaderState() {
-        persistBookmark(currentProgress, force = true)
+        if (progressChangedInSession) {
+            persistBookmark(currentProgress, force = true)
+        }
         if (!trackingLocked && !appBackgrounded) {
             statisticsTracker.update(totalExploredCharCount)
         }
@@ -798,13 +805,11 @@ class ReaderViewModel(
         chapterSessionStartMs = now
         val durationMs = if (started > 0L) (now - started).coerceAtLeast(0L) else 0L
         val stats = statisticsTracker.statisticsForPersistence()
-        if (openNovel == null) {
-            runCatching { BookStorage.saveStatistics(stats, rootUrl) }
-        }
+        runCatching { BookStorage.saveStatistics(stats, rootUrl) }
         runBlocking(Dispatchers.IO) {
-            runCatching { persistChapterRow(exitedIndex, currentProgress, totalExploredCharCount) }
-                .onFailure { Log.w("NovelReader", "close chapter persist failed", it) }
-            if (durationMs > 0) {
+            if (progressChangedInSession) {
+                runCatching { persistChapterRow(exitedIndex, currentProgress, totalExploredCharCount) }
+                    .onFailure { Log.w("NovelReader", "close chapter persist failed", it) }
                 runCatching { persistHistoryVisit(exitedIndex, durationMs) }
                     .onFailure { Log.w("NovelReader", "close history persist failed", it) }
             }
@@ -844,26 +849,38 @@ class ReaderViewModel(
     fun flushSyncExport() {
         val sync = ttuSyncManager ?: return
         if (!sync.isEnabled || !sync.autoSyncOnClose) return
+        if (totalExploredCharCount <= 0 && currentProgress <= 0.0 && index == 0) return
+        if (!progressChangedInSession) return
         ttuSyncExportJob?.cancel()
         ttuSyncExportJob = scope.launch(Dispatchers.IO) {
             runCatching { persistChapterRow(index, currentProgress, totalExploredCharCount) }
-            if (openNovel == null) {
-                runCatching {
-                    BookStorage.save(
-                        Bookmark(
-                            chapterIndex = index,
-                            progress = currentProgress,
-                            characterCount = totalExploredCharCount,
-                            lastModified = System.currentTimeMillis(),
-                        ),
-                        rootUrl,
-                        FileNames.bookmark,
-                    )
-                }
-            }
             runCatching { sync.syncBook(ttuBookRef()) }
                 .onFailure { Log.w("NovelReader", "close sync export failed", it) }
         }
+    }
+
+    private suspend fun loadPersistedStatistics(): List<Statistics>? {
+        val novel = openNovel
+        if (novel != null) {
+            val dbStats = ttuStatsRepository?.let { repo ->
+                runCatching { repo.getByNovelId(novel.id) }.getOrNull()
+                    ?.map {
+                        Statistics(
+                            title = document.title ?: "Unknown",
+                            dateKey = it.dateKey,
+                            charactersRead = it.charactersRead,
+                            readingTime = it.readingTime,
+                            minReadingSpeed = it.minReadingSpeed,
+                            altMinReadingSpeed = it.altMinReadingSpeed,
+                            lastReadingSpeed = it.lastReadingSpeed,
+                            maxReadingSpeed = it.maxReadingSpeed,
+                            completedBook = it.completedBook,
+                        )
+                    }
+            }
+            if (!dbStats.isNullOrEmpty()) return dbStats
+        }
+        return BookStorage.loadStatistics(rootUrl)
     }
 
     /** Re-seeds position + statistics views from durable storage after an import. */
@@ -875,34 +892,15 @@ class ReaderViewModel(
             index = bookmark.chapterIndex.coerceIn(0, (chapterCount - 1).coerceAtLeast(0))
             currentProgress = bookmark.progress.coerceIn(0.0, 1.0)
             totalExploredCharCount = bookmark.characterCount
+            bookmarkLastModified = bookmark.lastModified ?: 0L
+            progressChangedInSession = false
             lastSavedChapterIndex = index
             lastSavedProgress = currentProgress
             lastSavedCharacterCount = totalExploredCharCount
             statisticsTracker.resetBaseline(totalExploredCharCount)
             bridge.updateProgress(currentProgress)
         }
-        val history = withContext(Dispatchers.IO) {
-            if (openNovel == null) {
-                BookStorage.loadStatistics(rootUrl)
-            } else {
-                ttuStatsRepository?.let { repo ->
-                    runCatching { repo.getByNovelId(openNovel!!.id) }.getOrNull()
-                        ?.map {
-                            Statistics(
-                                title = document.title ?: "Unknown",
-                                dateKey = it.dateKey,
-                                charactersRead = it.charactersRead,
-                                readingTime = it.readingTime,
-                                minReadingSpeed = it.minReadingSpeed,
-                                altMinReadingSpeed = it.altMinReadingSpeed,
-                                lastReadingSpeed = it.lastReadingSpeed,
-                                maxReadingSpeed = it.maxReadingSpeed,
-                                completedBook = it.completedBook,
-                            )
-                        }
-                }
-            }
-        }
+        val history = withContext(Dispatchers.IO) { loadPersistedStatistics() }
         history?.let { statisticsTracker.replaceHistory(it) }
     }
 
@@ -986,13 +984,12 @@ class ReaderViewModel(
 
     /** Manga per-visit `updateHistory`: when + how-long only, never position. */
     private suspend fun persistHistoryVisit(chapterIndex: Int, durationMs: Long) {
-        if (durationMs <= 0) return
         val repos = novelRepos ?: return
         val chapterId = resolveOwnNovelChapters()?.second?.getOrNull(chapterIndex) ?: return
         repos.third.upsertHistory(
             chapterId = chapterId,
             lastRead = System.currentTimeMillis(),
-            timeRead = durationMs,
+            timeRead = maxOf(0L, durationMs),
         )
     }
 
@@ -1109,7 +1106,8 @@ class ReaderViewModel(
                 ?.replace("\\", "/")
             val href = document.getChapterHref(i)
             if ((chapterPath != null && chapterPath == targetPath) ||
-                (href != null && (targetPath == href || targetPath.endsWith("/$href")))) {
+                (href != null && (targetPath == href || targetPath.endsWith("/$href")))
+            ) {
                 // Save progress before jumping so stats are consistent
                 saveBookmark(currentProgress)
                 jumpToChapter(i, fragment.ifEmpty { null })
@@ -1139,7 +1137,7 @@ class ReaderViewModel(
             chapterIndex = index,
             progress = chapter.progress.coerceIn(0.0, 1.0),
             characterCount = chapter.lastPageRead.toInt(),
-            lastModified = System.currentTimeMillis(),
+            lastModified = history.lastRead,
         )
     }
 
@@ -1348,22 +1346,25 @@ class ReaderViewModel(
         val characterCount = calculateExploredCharCount(progress)
         totalExploredCharCount = characterCount
 
-        val changed = force ||
-            index != lastSavedChapterIndex ||
+        val hasMoved = index != lastSavedChapterIndex ||
             characterCount != lastSavedCharacterCount ||
             abs(progress - lastSavedProgress) > BOOKMARK_PROGRESS_EPSILON
 
+        if (hasMoved) {
+            progressChangedInSession = true
+            bookmarkLastModified = System.currentTimeMillis()
+        }
+
+        val changed = force || hasMoved
+
         if (!changed) return
 
-        // Ticks fire continuously while scrolling: disk writes leave Main, except
-        // turn/background/close (force) which need synchronous durability.
-        // Sidecar survives only for unregistered books; rows carry the rest.
         if (openNovel == null) {
             val snapshot = Bookmark(
                 chapterIndex = index,
                 progress = progress,
                 characterCount = characterCount,
-                lastModified = System.currentTimeMillis(),
+                lastModified = bookmarkLastModified,
             )
             if (force) {
                 BookStorage.save(snapshot, rootUrl, FileNames.bookmark)
@@ -1379,7 +1380,7 @@ class ReaderViewModel(
 
         // Manga per-page `updateChapter`: mirror position + read flag into the
         // chapter row (repos absent standalone → sidecar only).
-        if (novelRepos != null) {
+        if (novelRepos != null && hasMoved) {
             scope.launch(kotlinx.coroutines.Dispatchers.IO) {
                 runCatching { persistChapterRow(index, progress, characterCount) }
                     .onFailure { Log.w("NovelReader", "persist failed", it) }
@@ -1417,10 +1418,7 @@ class ReaderViewModel(
 
     private fun persistToDisk() {
         val stats = statisticsTracker.statisticsForPersistence()
-        // Sidecar survives only for unregistered books; rows carry the rest.
-        if (openNovel == null) {
-            BookStorage.saveStatistics(stats, rootUrl)
-        }
+        runCatching { BookStorage.saveStatistics(stats, rootUrl) }
         persistStatsToDb(stats)
     }
 
